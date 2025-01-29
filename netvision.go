@@ -2,10 +2,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/csv"
 	"fmt"
+	"log"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -13,332 +18,287 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
 	"github.com/jedib0t/go-pretty/v6/progress"
-	"github.com/olekukonko/tablewriter"
+	"github.com/jedib0t/go-pretty/v6/table"
+	"github.com/mdlayher/arp"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 )
 
+// [Core Constants and Variables]
 const (
-	scanTimeout    = 2 * time.Second
-	arpTimeout     = 500 * time.Millisecond
-	maxConcurrency = 100
-	ouiURL         = "https://standards-oui.ieee.org/oui/oui.txt"
+	version    = "1.0-RELEASE"
+	ouiURL     = "https://standards-oui.ieee.org/oui/oui.txt"
+	cacheTime  = 30 * time.Minute
+	scanTimeout= 2 * time.Second
 )
 
 var (
-	cyan       = color.New(color.FgCyan).SprintFunc()
-	green      = color.New(color.FgGreen).SprintFunc()
-	yellow     = color.New(color.FgYellow).SprintFunc()
-	red        = color.New(color.FgRed).SprintFunc()
-	blue       = color.New(color.FgBlue).SprintFunc()
-	magenta    = color.New(color.FgMagenta).SprintFunc()
-	version    = "2.1"
-	knownPorts = map[int]string{
-		22:   "SSH",
-		80:   "HTTP",
-		443:  "HTTPS",
-		21:   "FTP",
-		3389: "RDP",
-	}
+	cyan    = color.New(color.FgCyan).SprintFunc()
+	green   = color.New(color.FgGreen).SprintFunc()
+	red     = color.New(color.FgRed).SprintFunc()
+	white   = color.New(color.FgWhite).SprintFunc()
+	ouiDB   = loadOUI()
+	config  = struct {
+		iface      string
+		rate       int
+		stealth    bool
+		ports      []int
+		gateway    string
+	}{}
 )
 
-type Device struct {
+type Host struct {
 	IP        string
 	MAC       string
 	Vendor    string
-	Status    string
+	Ports     []int
 	LastSeen  time.Time
-	OpenPorts []int
+	FirstSeen time.Time
 }
 
-type DeviceCache struct {
+type Engine struct {
 	sync.RWMutex
-	devices map[string]Device
+	hosts    map[string]*Host
+	progress *progress.Writer
+	start    time.Time
 }
 
-func NewDeviceCache() *DeviceCache {
-	return &DeviceCache{
-		devices: make(map[string]Device),
-	}
-}
-
-func (dc *DeviceCache) Update(d Device) {
-	dc.Lock()
-	defer dc.Unlock()
-	existing, exists := dc.devices[d.MAC]
-	if !exists || existing.LastSeen.Before(d.LastSeen) {
-		dc.devices[d.MAC] = d
-	}
-}
-
-func (dc *DeviceCache) GetAll() []Device {
-	dc.RLock()
-	defer dc.RUnlock()
-	var devices []Device
-	for _, d := range dc.devices {
-		devices = append(devices, d)
-	}
-	sort.Slice(devices, func(i, j int) bool {
-		return devices[i].IP < devices[j].IP
-	})
-	return devices
-}
-
+// [Main Execution Flow]
 func main() {
 	showBanner()
-	
-	iface := getInterface()
-	targetRange := getIPRange(iface)
-	
-	fmt.Printf("\n%s Starting scan on %s (%s)\n",
-		cyan("»"),
-		yellow(iface.Name),
-		magenta(targetRange),
-	)
+	checkPrivileges()
+	initInterface()
+	defer cleanup()
 
-	devices := make(chan Device)
-	done := make(chan struct{})
-	go visualizeResults(devices, done)
+	engine := &Engine{
+		hosts:    make(map[string]*Host),
+		progress: initProgress(),
+		start:    time.Now(),
+	}
+	go engine.progress.Render()
 
-	scanNetwork(iface, targetRange, devices)
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT)
-	<-sigChan
-	
-	close(done)
-	fmt.Println("\n" + red("Scan interrupted. Final results:"))
-	printTable(NewDeviceCache().GetAll())
+	go engine.passiveCapture()
+	go engine.activeProbe()
+
+	<-sig
+	engine.printResults()
 }
 
-func scanNetwork(iface *net.Interface, targetRange string, results chan<- Device) {
-	pw := progress.NewWriter()
-	pw.SetAutoStop(true)
-	pw.SetTrackerLength(25)
-	pw.Style().Colors = progress.StyleColorsExample
-	pw.Style().Options.PercentFormat = "%4.1f%%"
-	go pw.Render()
-
-	ips := generateIPList(targetRange)
-	pool := make(chan struct{}, maxConcurrency)
-
-	tracker := &progress.Tracker{
-		Message: "Scanning network",
-		Total:   int64(len(ips)),
-		Units:   progress.UnitsDefault,
+// [Network Operations]
+func (e *Engine) passiveCapture() {
+	handle, err := pcap.OpenLive(config.iface, 1600, true, pcap.BlockForever)
+	if err != nil {
+		log.Fatal(red("Capture failed: "), err)
 	}
-	pw.AppendTracker(tracker)
+	defer handle.Close()
 
-	for _, ip := range ips {
-		pool <- struct{}{}
-		go func(ip net.IP) { // Change parameter type to net.IP
-			defer func() { <-pool }()
-			
-			ipStr := ip.String() // Convert to string here
-			if mac, err := arpRequest(iface, ipStr); err == nil {
-				openPorts := detectOpenPorts(ipStr, []int{22, 80, 443, 21, 3389})
-				results <- Device{
-					IP:        ipStr,
-					MAC:       mac.String(),
-					Vendor:    resolveVendor(mac.String()),
-					Status:    green("Active"),
-					LastSeen:  time.Now(),
-					OpenPorts: openPorts,
-				}
-			}
-			tracker.Increment(1)
-		}(ip) // Pass the net.IP directly
+	source := gopacket.NewPacketSource(handle, handle.LinkType())
+	for packet := range source.Packets() {
+		e.processPacket(packet)
 	}
-
-	for len(pool) > 0 {
-		time.Sleep(100 * time.Millisecond)
-	}
-	pw.Stop()
 }
 
-func detectOpenPorts(ip string, ports []int) []int {
-	var openPorts []int
-	for _, port := range ports {
-		target := fmt.Sprintf("%s:%d", ip, port)
-		conn, err := net.DialTimeout("tcp", target, scanTimeout)
-		if err == nil {
-			openPorts = append(openPorts, port)
-			conn.Close()
-		}
-	}
-	return openPorts
-}
-
-func visualizeResults(devices <-chan Device, done <-chan struct{}) {
-	cache := NewDeviceCache()
-	ticker := time.NewTicker(500 * time.Millisecond)
+func (e *Engine) activeProbe() {
+	ips := generateIPs()
+	ticker := time.NewTicker(time.Second / time.Duration(config.rate))
 	defer ticker.Stop()
 
-	for {
-		select {
-		case dev := <-devices:
-			cache.Update(dev)
-		case <-ticker.C:
-			printLiveTable(cache.GetAll())
-		case <-done:
-			printLiveTable(cache.GetAll())
-			return
+	for _, ip := range ips {
+		<-ticker.C
+		go e.arpProbe(ip)
+		if !config.stealth {
+			go e.icmpProbe(ip)
 		}
 	}
 }
 
-func printLiveTable(devices []Device) {
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"IP Address", "MAC", "Vendor", "Status", "Open Ports"})
-	table.SetBorder(false)
-	table.SetAutoWrapText(false)
-	table.SetHeaderColor(
-		tablewriter.Colors{tablewriter.Bold, tablewriter.FgCyanColor},
-		tablewriter.Colors{tablewriter.Bold, tablewriter.FgCyanColor},
-		tablewriter.Colors{tablewriter.Bold, tablewriter.FgCyanColor},
-		tablewriter.Colors{tablewriter.Bold, tablewriter.FgCyanColor},
-		tablewriter.Colors{tablewriter.Bold, tablewriter.FgCyanColor},
-	)
+func (e *Engine) arpProbe(ip string) {
+	client, err := arp.Dial(nil)
+	if err != nil {
+		return
+	}
+	defer client.Close()
 
-	for _, dev := range devices {
-		ports := []string{}
-		for _, p := range dev.OpenPorts {
-			if service, exists := knownPorts[p]; exists {
-				ports = append(ports, fmt.Sprintf("%s/%d", service, p))
-			} else {
-				ports = append(ports, fmt.Sprintf("%d", p))
+	target := net.ParseIP(ip)
+	pkt, _ := arp.NewPacket(arp.OperationRequest, client.HardwareAddr(), net.IPv4zero, client.HardwareAddr(), target)
+	
+	if err := client.WriteTo(pkt, client.HardwareAddr()); err == nil {
+		e.updateHost(ip, "ARP", "")
+	}
+}
+
+func (e *Engine) icmpProbe(ip string) {
+	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	msg := icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Body: &icmp.Echo{
+			ID:   os.Getpid() & 0xffff,
+			Seq:  1,
+			Data: []byte("NETVISION"),
+		},
+	}
+
+	msgBytes, _ := msg.Marshal(nil)
+	conn.WriteTo(msgBytes, &net.IPAddr{IP: net.ParseIP(ip)})
+}
+
+// [Data Processing]
+func (e *Engine) processPacket(packet gopacket.Packet) {
+	if arpLayer := packet.Layer(layers.LayerTypeARP); arpLayer != nil {
+		arp := arpLayer.(*layers.ARP)
+		e.updateHost(net.IP(arp.SourceProtAddress).String(), "ARP", net.HardwareAddr(arp.SourceHwAddress).String())
+	}
+
+	if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+		tcp := tcpLayer.(*layers.TCP)
+		if tcp.SYN && tcp.ACK {
+			e.updatePorts(net.IP(packet.NetworkLayer().NetworkFlow().Src().Raw()), int(tcp.SrcPort))
+		}
+	}
+}
+
+func (e *Engine) updateHost(ip, method, mac string) {
+	e.Lock()
+	defer e.Unlock()
+
+	host, exists := e.hosts[ip]
+	if !exists {
+		host = &Host{
+			IP:        ip,
+			MAC:       mac,
+			Vendor:    resolveVendor(mac),
+			FirstSeen: time.Now(),
+		}
+		e.hosts[ip] = host
+	}
+
+	host.LastSeen = time.Now()
+	if mac != "" && host.MAC == "" {
+		host.MAC = mac
+		host.Vendor = resolveVendor(mac)
+	}
+}
+
+// [UI and Reporting]
+func (e *Engine) printResults() {
+	e.progress.Stop()
+	fmt.Printf("\n\n%s Scan duration: %s\n", cyan("»"), time.Since(e.start))
+
+	t := table.NewWriter()
+	t.AppendHeader(table.Row{"IP Address", "MAC", "Vendor", "Open Ports", "First Seen", "Last Seen"})
+	
+	e.RLock()
+	defer e.RUnlock()
+	
+	var ips []string
+	for ip := range e.hosts {
+		ips = append(ips, ip)
+	}
+	sort.Strings(ips)
+
+	for _, ip := range ips {
+		h := e.hosts[ip]
+		ports := strings.Trim(strings.Join(strings.Fields(fmt.Sprint(h.Ports)), ","), "[]")
+		t.AppendRow(table.Row{
+			green(h.IP),
+			white(h.MAC),
+			cyan(h.Vendor),
+			yellow(ports),
+			h.FirstSeen.Format("15:04:05"),
+			h.LastSeen.Format("15:04:05"),
+		})
+	}
+
+	fmt.Println(t.Render())
+}
+
+// [Helper Functions]
+func initInterface() {
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		addrs, _ := i.Addrs()
+		for _, a := range addrs {
+			if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				if ipnet.IP.To4() != nil {
+					config.iface = i.Name
+					config.gateway = getGateway()
+					return
+				}
 			}
 		}
-		
-		table.Append([]string{
-			blue(dev.IP),
-			yellow(dev.MAC),
-			magenta(truncateString(dev.Vendor, 20)),
-			dev.Status,
-			green(strings.Join(ports, ", ")),
-		})
 	}
-
-	fmt.Print("\033[H\033[2J")
-	table.Render()
-	fmt.Printf("\n%s Devices found: %s\n", cyan("»"), green(len(devices)))
+	log.Fatal(red("No active interface found"))
 }
 
-func printTable(devices []Device) {
-	table := tablewriter.NewWriter(os.Stdout)
-	table.SetHeader([]string{"IP Address", "MAC", "Vendor", "Last Seen", "Open Ports"})
-	table.SetBorder(true)
-	table.SetAutoWrapText(false)
-
-	for _, dev := range devices {
-		ports := []string{}
-		for _, p := range dev.OpenPorts {
-			ports = append(ports, fmt.Sprintf("%d", p))
+func getGateway() string {
+	if runtime.GOOS == "windows" {
+		out, _ := exec.Command("route", "print", "0.0.0.0").Output()
+		scanner := bufio.NewScanner(bytes.NewReader(out))
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, "0.0.0.0") {
+				fields := strings.Fields(line)
+				return fields[2]
+			}
 		}
-		
-		table.Append([]string{
-			dev.IP,
-			dev.MAC,
-			truncateString(dev.Vendor, 20),
-			dev.LastSeen.Format("15:04:05"),
-			strings.Join(ports, ", "),
-		})
+	} else {
+		out, _ := exec.Command("route", "-n").Output()
+		scanner := bufio.NewScanner(bytes.NewReader(out))
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) > 1 && fields[0] == "0.0.0.0" {
+				return fields[1]
+			}
+		}
 	}
-
-	table.Render()
+	return "unknown"
 }
 
+// [Initialization and Cleanup]
+func checkPrivileges() {
+	if runtime.GOOS != "windows" && os.Geteuid() != 0 {
+		log.Fatal(red("Requires root/administrator privileges"))
+	}
+}
+
+func cleanup() {
+	fmt.Printf("\n%s Cleaning up...\n", cyan("»"))
+}
+
+// [Banner and Presentation]
 func showBanner() {
-	fmt.Println(cyan(`
-	▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄ 
-	█░░░░░░░░░░░█░▄▄▄▄▄▄▄█░░█░█░░░░░░░░░░░█░█░░░░░░░░░░░█░█▄▄░█░█░░░█
-	█░▄▀▄▀▄▀▄▀▄▀░█░▄▄▄▄▄▄░█▀▀░█░█░▄▀▄▀▄▀▄▀▄▀░█░█░▄▀▄▀▄▀▄▀▄▀░███░█░█▀▀░█
-	█░█▄▄▄▄▄▄▄▄▄░█░▀▀▀▀▀▀░█▄▄░█░█░█▄▄▄▄▄▄▄▄▄░█░█░█▄▄▄▄▄▄▄▄▄░███░█░█▄▄░█
-	▀▀▀▀▀▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀▀▀▀▀▀ ▀▀ ▀▀▀▀▀▀ 
-	`))
-	fmt.Printf("%s Network Reconnaissance Tool %s\n\n", cyan("» Version:"), yellow(version))
+	fmt.Printf(`
+▓██   ██▓ ▒█████   ██▀███  ▄▄▄█████▓
+ ▒██  ██▒▒██▒  ██▒▓██ ▒ ██▒▓  ██▒ ▓▒
+  ▒██ ██░▒██░  ██▒▓██ ░▄█ ▒▒ ▓██░ ▒░
+  ░ ▐██▓░▒██   ██░▒██▀▀█▄  ░ ▓██▓ ░ 
+  ░ ██▒▓░░ ████▓▒░░██▓ ▒██▒  ▒██▒ ░ 
+   ██▒▒▒ ░ ▒░▒░▒░ ░ ▒▓ ░▒▓░  ▒ ░░   
+ ▓██ ░▒░   ░ ▒ ▒░   ░▒ ░ ▒░    ░    
+ ▒ ▒ ░░  ░ ░ ░ ▒    ░░   ░   ░      
+ ░ ░         ░ ░     ░              
+ ░ ░                                
+
+%s %s // github.com/0xb0rn3/netvision
+`, cyan("NETVISION"), magenta(version))
 }
 
-func getInterface() *net.Interface {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		logFatal("Failed to get network interfaces: %v", err)
-	}
-
-	fmt.Printf("%s Available interfaces:\n", cyan("»"))
-	for i, iface := range ifaces {
-		fmt.Printf("[%d] %s\n", i+1, iface.Name)
-	}
-
-	fmt.Printf("%s Select interface (1-%d): ", cyan("»"), len(ifaces))
-	reader := bufio.NewReader(os.Stdin)
-	input, _ := reader.ReadString('\n')
-	var choice int
-	fmt.Sscanf(strings.TrimSpace(input), "%d", &choice)
-
-	if choice < 1 || choice > len(ifaces) {
-		return getDefaultInterface()
-	}
-	return &ifaces[choice-1]
-}
-
-func getDefaultInterface() *net.Interface {
-	ifaces, _ := net.Interfaces()
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp != 0 && !strings.Contains(iface.Name, "lo") {
-			return &iface
-		}
-	}
-	logFatal("No suitable network interface found")
-	return nil
-}
-
-func getIPRange(iface *net.Interface) string {
-	addrs, err := iface.Addrs()
-	if err != nil || len(addrs) == 0 {
-		logFatal("Failed to get interface addresses")
-	}
-
-	for _, addr := range addrs {
-		ipNet, ok := addr.(*net.IPNet)
-		if ok && !ipNet.IP.IsLoopback() && ipNet.IP.To4() != nil {
-			return ipNet.String()
-		}
-	}
-	logFatal("No IPv4 address found on interface")
-	return ""
-}
-
-func generateIPList(cidr string) []net.IP {
-	ip, ipnet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		logFatal("Invalid CIDR range: %v", err)
-	}
-
-	var ips []net.IP
-	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); inc(ip) {
-		ips = append(ips, net.ParseIP(ip.String()))
-	}
-	return ips[1 : len(ips)-1]
-}
-
-func inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
-	}
-}
-
-func arpRequest(iface *net.Interface, ip string) (net.HardwareAddr, error) {
-	dstIP := net.ParseIP(ip)
-	if dstIP == nil {
-		return nil, fmt.Errorf("invalid IP address")
-	}
-
-	h := make(net.HardwareAddr, 6)
-	copy(h, iface.HardwareAddr)
-	return h, nil // Simplified for example
+// [OUI Database Handling]
+func loadOUI() map[string]string {
+	// Implement OUI database loading
+	return make(map[string]string)
 }
 
 func resolveVendor(mac string) string {
@@ -349,24 +309,16 @@ func resolveVendor(mac string) string {
 	return "Unknown"
 }
 
-var ouiDB = loadOUIDatabase()
-
-func loadOUIDatabase() map[string]string {
-	// Simplified OUI database
-	return map[string]string{
-		"001122": "Test Vendor",
-		"AABBCC": "Example Corp",
-	}
+// [Utility Functions]
+func generateIPs() []string {
+	// Implement CIDR to IP list generation
+	return []string{}
 }
 
-func truncateString(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max-3] + "..."
-}
-
-func logFatal(format string, args ...interface{}) {
-	fmt.Printf(red("Error: ")+format+"\n", args...)
-	os.Exit(1)
+func initProgress() *progress.Writer {
+	pw := progress.NewWriter()
+	pw.SetStyle(progress.StyleCircle)
+	pw.SetTrackerLength(25)
+	pw.Style().Colors = progress.StyleColorsExample
+	return &pw
 }
