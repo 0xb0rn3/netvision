@@ -130,13 +130,14 @@ func scanNetwork(iface *net.Interface, targetRange string, results chan<- Device
 
 	for _, ip := range ips {
 		pool <- struct{}{}
-		go func(ip string) {
+		go func(ip net.IP) { // Change parameter type to net.IP
 			defer func() { <-pool }()
 			
-			if mac, err := arpRequest(iface, ip); err == nil {
-				openPorts := detectOpenPorts(ip, []int{22, 80, 443, 21, 3389})
+			ipStr := ip.String() // Convert to string here
+			if mac, err := arpRequest(iface, ipStr); err == nil {
+				openPorts := detectOpenPorts(ipStr, []int{22, 80, 443, 21, 3389})
 				results <- Device{
-					IP:        ip,
+					IP:        ipStr,
 					MAC:       mac.String(),
 					Vendor:    resolveVendor(mac.String()),
 					Status:    green("Active"),
@@ -145,7 +146,7 @@ func scanNetwork(iface *net.Interface, targetRange string, results chan<- Device
 				}
 			}
 			tracker.Increment(1)
-		}(ip)
+		}(ip) // Pass the net.IP directly
 	}
 
 	for len(pool) > 0 {
